@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this software or data, please cite the associated manuscript and the archived Zenodo release."
+title: "Order Finding from Phase Dynamics in Topological Acoustics"
+authors:
+  - family-names: Kuk
+    given-names: Ilia
+    orcid: https://orcid.org/0009-0006-7242-7291
+  - family-names: Deymier
+    given-names: Pierre A.
+  - family-names: Djordjevic
+    given-names: Ivan B.
+  - family-names: Runge
+    given-names: Keith
+repository-code: "https://github.com/CosmosRedshift7/order-finding-phase-dynamics"
+doi: "10.5281/zenodo.XXXXXXX"
+license: MIT
+date-released: "2026-06-08"
