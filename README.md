@@ -6,9 +6,10 @@ This repository contains the analysis code and experimental phase data used for 
 
 ## Repository contents
 
-- `main.py` — main analysis script.
-- `phases_1.mat` — experimental phase data used by the script.
-- `results/` — generated figures and calibration parameters.
+- `main.py` — main analysis script for the calibrated phase-dynamics figures.
+- `heatmap.py` — period-detection heatmap sweep for the two cases $N=55$ and $N=135$.
+- `phases_1.mat` — experimental phase data used by the scripts.
+- `results/` — generated figures, heatmaps, and calibration parameters.
 - `requirements.txt` — Python dependencies.
 
 ## Requirements
@@ -66,11 +67,22 @@ Alternatively, run the script explicitly with the virtual-environment Python:
 .venv/bin/python main.py
 ```
 
-The script reads `phases_1.mat` and writes the output files to the `results/` directory. The expected outputs include:
+The main script reads `phases_1.mat` and writes the calibrated phase-dynamics figures to the `results/` directory. The expected outputs include:
 
 - `results/N55_a4_W8_Delta7.pdf`
 - `results/N135_a4_W8_Delta10.pdf`
 - `results/calibration_params_phi_12.txt`
+
+To reproduce the period-detection heatmaps, run:
+
+```bash
+python heatmap.py
+```
+
+The heatmap script writes:
+
+- `results/N55_a4_x0_1_heatmap.pdf`
+- `results/N135_a4_x0_1_heatmap.pdf`
 
 ## Citation
 
