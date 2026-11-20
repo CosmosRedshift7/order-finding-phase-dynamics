@@ -1,3 +1,5 @@
+from fractions import Fraction
+from frequency_control import frequency_steps
 import os
 from dataclasses import dataclass, replace
 
@@ -13,8 +15,17 @@ plt.style.use(["science", "ieee"])
 MAT_PATH = "phases_1.mat"
 OUTDIR = "results"
 
-USE_CRAMERI_CMAP = False
-CRAMERI_CMAP_NAME = "batlow"
+USE_CRAMERI_CMAP = True
+# Crameri's categorical palette: the first four entries maximize distinction.
+# https://www.fabiocrameri.ch/categorical-colour-maps/
+CRAMERI_CMAP_NAME = "vik"
+
+# Category codes label the output; they do not affect the phase iteration.
+NO_RETURN = 0
+INVALID_PERIOD = 1
+VALID_MULTIPLE = 2
+EXACT_ORDER = 3
+CLASS_LABELS = ("No return", "Invalid period", "Valid multiple", "Exact order")
 
 FMIN_HZ = 71000.0
 FMAX_HZ = 73000.0
@@ -30,11 +41,11 @@ CASES = (
 
 WRAPS_MIN = 1.0
 WRAPS_MAX = 45.0
-WRAPS_NUM = 700
+WRAPS_NUM = 1500
 
 DELTA_MIN = 0.1
 DELTA_MAX = 90.0
-DELTA_NUM = 700
+DELTA_NUM = 1500
 
 MAX_STEPS = 256
 MIN_DF_KHZ = 1e-3
@@ -205,84 +216,18 @@ def align_calibration(cal: Calibration, case: SweepCase) -> Calibration:
     )
 
 
-def frequency_for_state(
-    phi_base_deg: float,
-    slope: float,
-    intercept: float,
-    last_f_khz: float | None,
-    min_df_khz: float,
-    f_min_khz: float,
-    f_max_khz: float,
-) -> float | None:
-    if np.isclose(slope, 0.0):
-        return None
-
-    def f_of_n(n: int) -> float:
-        return float((phi_base_deg + 360.0 * n - intercept) / slope)
-
-    if slope > 0:
-        n_lo = int(
-            np.ceil((f_min_khz * slope + intercept - phi_base_deg) / 360.0 - 1e-12)
-        )
-        n_hi = int(
-            np.floor((f_max_khz * slope + intercept - phi_base_deg) / 360.0 + 1e-12)
-        )
-    else:
-        n_lo = int(
-            np.ceil((f_max_khz * slope + intercept - phi_base_deg) / 360.0 - 1e-12)
-        )
-        n_hi = int(
-            np.floor((f_min_khz * slope + intercept - phi_base_deg) / 360.0 + 1e-12)
-        )
-
-    if n_lo > n_hi:
-        return None
-
-    if last_f_khz is None:
-        n_values = np.arange(n_lo, n_hi + 1, dtype=int)
-        f_values = np.array([f_of_n(int(n)) for n in n_values], dtype=float)
-        return float(
-            f_values[np.argmin(np.abs(f_values - 0.5 * (f_min_khz + f_max_khz)))]
-        )
-
-    f_required = last_f_khz + min_df_khz
-
-    if slope > 0:
-        n = int(
-            np.ceil((f_required * slope + intercept - phi_base_deg) / 360.0 - 1e-12)
-        )
-        n = max(n, n_lo)
-        return None if n > n_hi else f_of_n(n)
-
-    n = int(np.floor((f_required * slope + intercept - phi_base_deg) / 360.0 + 1e-12))
-    n = min(n, n_hi)
-    return None if n < n_lo else f_of_n(n)
-
-
 def return_distances(cal: Calibration, case: SweepCase) -> np.ndarray:
     distances = np.full(MAX_STEPS + 1, np.inf, dtype=float)
-    x = int(case.x0)
-    last_f = float(cal.f_min_khz)
-    phi0 = float(wrap_360(interp_at(cal.f_sel_khz, cal.phi_unwrapped_avg, last_f)))
-
-    for step in range(1, MAX_STEPS + 1):
-        x = (case.a * x) % case.N
-        phi_base = float(wrap_360(phi_target_deg(x, case.N)))
-        f_khz = frequency_for_state(
-            phi_base,
-            cal.slope,
-            cal.intercept,
-            last_f,
-            MIN_DF_KHZ,
-            cal.f_min_khz,
-            cal.f_max_khz,
-        )
-        if f_khz is None or not np.isfinite(f_khz):
-            break
-
-        phi_t = float(wrap_360(interp_at(cal.f_sel_khz, cal.phi_unwrapped_avg, f_khz)))
-        distances[step] = abs(float(wrap_pm180(phi_t - phi0)))
-        last_f = float(f_khz)
+    initial_phase = Fraction(360 * (case.x0 % case.N), case.N)
+    trajectory = frequency_steps(
+        cal.slope, cal.intercept, cal.f_min_khz, cal.f_max_khz,
+        MIN_DF_KHZ, case.a, initial_phase, MAX_STEPS,
+    )
+    initial_frequency, _, _ = next(trajectory)
+    phi0 = interp_at(cal.f_sel_khz, cal.phi_unwrapped_avg, initial_frequency)
+    for step, (frequency, _, _) in enumerate(trajectory, start=1):
+        phase = interp_at(cal.f_sel_khz, cal.phi_unwrapped_avg, frequency)
+        distances[step] = abs(float(wrap_pm180(phase - phi0)))
 
     return distances
 
@@ -310,9 +255,25 @@ def centered_extent(x_values: np.ndarray, y_values: np.ndarray) -> list[float]:
     ]
 
 
+def classify_detected_periods(detected: np.ndarray, true_period: int) -> np.ndarray:
+    """Label first-return candidates using the original reference period.
+
+    For the configured coprime bases and initial states, true_period is the
+    multiplicative order. A positive k is valid iff k is a multiple of it.
+    This classification does not change how a candidate is generated.
+    """
+    classes = np.full(detected.shape, NO_RETURN, dtype=int)
+    has_return = detected > 0
+    classes[has_return] = INVALID_PERIOD
+    nonminimal_multiple = (detected > true_period) & (detected % true_period == 0)
+    classes[nonminimal_multiple] = VALID_MULTIPLE
+    classes[detected == true_period] = EXACT_ORDER
+    return classes
+
+
 def heatmap_cmap() -> ListedColormap:
     if not USE_CRAMERI_CMAP:
-        return ListedColormap(["white", "black"])
+        return ListedColormap(["white", "0.75", "0.4", "black"], name="period_classes")
 
     try:
         import cmcrameri.cm as cmc
@@ -321,7 +282,13 @@ def heatmap_cmap() -> ListedColormap:
     except (ImportError, AttributeError):
         base = plt.get_cmap(f"cmc.{CRAMERI_CMAP_NAME}")
 
-    return ListedColormap([base(0.08), base(0.88)])
+    if CRAMERI_CMAP_NAME.endswith("S"):
+        # Integer indices select the first distinct categorical entries.
+        colors = base(np.arange(len(CLASS_LABELS)))
+    else:
+        # Also support a continuous Crameri map if the setting is changed.
+        colors = base(np.linspace(0.08, 0.92, len(CLASS_LABELS)))
+    return ListedColormap(colors, name=f"{CRAMERI_CMAP_NAME}_period_classes")
 
 
 def plot_heatmap(
@@ -332,7 +299,8 @@ def plot_heatmap(
     title: str,
 ) -> None:
     cmap = heatmap_cmap()
-    norm = BoundaryNorm([-0.5, 0.5, 1.5], cmap.N)
+    boundaries = np.arange(len(CLASS_LABELS) + 1) - 0.5
+    norm = BoundaryNorm(boundaries, cmap.N)
 
     fig, ax = plt.subplots()
     image = ax.imshow(
@@ -349,6 +317,16 @@ def plot_heatmap(
     ax.set_xlabel("Wraps")
     ax.set_ylabel(r"$\Delta$ (deg)")
     ax.grid(False)
+
+    colorbar = fig.colorbar(
+        image,
+        ax=ax,
+        boundaries=boundaries,
+        ticks=np.arange(len(CLASS_LABELS)),
+        spacing="uniform",
+        pad=0.03,
+    )
+    colorbar.set_ticklabels(CLASS_LABELS)
 
     fig.tight_layout()
     fig.savefig(outpdf, bbox_inches="tight")
@@ -369,10 +347,13 @@ def run_case(
         distances = return_distances(cal, case)
         detected = detected_periods_for_deltas(distances, delta_values)
         detected_periods[:, j] = detected
-        heat[:, j] = detected == true_period
+        heat[:, j] = classify_detected_periods(detected, true_period)
 
-    success_count = int(np.sum(heat))
+    success_count = int(np.count_nonzero(heat == EXACT_ORDER))
     print(f"N={case.N}: success count {success_count} / {heat.size}")
+    for code, label in enumerate(CLASS_LABELS):
+        count = int(np.count_nonzero(heat == code))
+        print(f"  {label}: {count} / {heat.size}")
 
     prefix = f"N{case.N}_a{case.a}_x0_{case.x0}"
 

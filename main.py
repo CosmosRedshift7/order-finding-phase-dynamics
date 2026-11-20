@@ -1,3 +1,5 @@
+from fractions import Fraction
+from frequency_control import frequency_steps
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -339,55 +341,6 @@ class Simulation:
     phi_cal_avg: np.ndarray
 
 
-def choose_wrap_index(
-    *,
-    phi_base_deg: float,
-    slope: float,
-    intercept: float,
-    last_f_khz: float | None,
-    min_df_khz: float,
-    f_min_khz: float,
-    f_max_khz: float,
-) -> tuple[int, float, bool]:
-    if np.isclose(slope, 0.0):
-        return 0, float("nan"), False
-
-    def frequency_for_wrap(n: int) -> float:
-        return float((phi_base_deg + 360.0 * n - intercept) / slope)
-
-    if slope > 0:
-        n_min = (f_min_khz * slope + intercept - phi_base_deg) / 360.0
-        n_max = (f_max_khz * slope + intercept - phi_base_deg) / 360.0
-    else:
-        n_min = (f_max_khz * slope + intercept - phi_base_deg) / 360.0
-        n_max = (f_min_khz * slope + intercept - phi_base_deg) / 360.0
-
-    n_lo = int(np.ceil(n_min - 1e-12))
-    n_hi = int(np.floor(n_max + 1e-12))
-
-    if n_lo > n_hi:
-        return 0, float("nan"), False
-
-    if last_f_khz is None:
-        n_values = np.arange(n_lo, n_hi + 1, dtype=int)
-        f_values = np.array([frequency_for_wrap(n) for n in n_values], dtype=float)
-        f_mid = 0.5 * (f_min_khz + f_max_khz)
-        best = int(np.argmin(np.abs(f_values - f_mid)))
-        return int(n_values[best]), float(f_values[best]), True
-
-    f_required = last_f_khz + min_df_khz
-    n_required = (f_required * slope + intercept - phi_base_deg) / 360.0
-
-    if slope > 0:
-        n = max(int(np.ceil(n_required - 1e-12)), n_lo)
-        ok = n <= n_hi
-    else:
-        n = min(int(np.floor(n_required + 1e-12)), n_hi)
-        ok = n >= n_lo
-
-    return n, frequency_for_wrap(n), bool(ok)
-
-
 def run_experiment(
     cal: Calibration,
     *,
@@ -407,64 +360,24 @@ def run_experiment(
     phase_error: list[float] = []
     wraps_used: list[int] = []
 
-    last_f_khz: float | None = None
+    initial_phase = Fraction(360 * (x0 % N), N)
+    trajectory = frequency_steps(
+        cal.slope_avg, cal.intercept_avg, cal.f_min_khz, cal.f_max_khz,
+        min_df_khz, a, initial_phase, max_steps - 1,
+    )
+    period_data = None
+    for t, (f_khz, target, branch) in enumerate(trajectory):
+        measured = float(wrap_360(interp_at(cal.f_khz, cal.phi_cal_avg, f_khz)))
+        x_true.append(round(target * N / 360) % N)
+        x_hat.append(decode_phase_to_x(measured, N))
+        phi_target.append(target)
+        phi_measured.append(measured)
+        freq_khz.append(f_khz)
+        phase_error.append(float(wrap_pm180(measured - target)))
+        wraps_used.append(branch)
 
-    def record_state(x_state: int, *, force_f_khz: float | None = None) -> bool:
-        nonlocal last_f_khz
-
-        base_phase = float(wrap_360(target_phase_deg(x_state, N)))
-
-        if force_f_khz is None:
-            n, f_khz, ok = choose_wrap_index(
-                phi_base_deg=base_phase,
-                slope=cal.slope_avg,
-                intercept=cal.intercept_avg,
-                last_f_khz=last_f_khz,
-                min_df_khz=min_df_khz,
-                f_min_khz=cal.f_min_khz,
-                f_max_khz=cal.f_max_khz,
-            )
-            if not ok or not np.isfinite(f_khz):
-                return False
-        else:
-            f_khz = float(np.clip(force_f_khz, cal.f_min_khz, cal.f_max_khz))
-            n = int(
-                np.rint(
-                    (f_khz * cal.slope_avg + cal.intercept_avg - base_phase) / 360.0
-                )
-            )
-
-        measured_unwrapped = interp_at(cal.f_khz, cal.phi_cal_avg, f_khz)
-        target_wrapped = float(wrap_360(base_phase + 360.0 * n))
-        measured_wrapped = float(wrap_360(measured_unwrapped))
-
-        x_true.append(int(x_state))
-        x_hat.append(decode_phase_to_x(measured_wrapped, N))
-        phi_target.append(target_wrapped)
-        phi_measured.append(measured_wrapped)
-        freq_khz.append(float(f_khz))
-        phase_error.append(float(wrap_pm180(measured_wrapped - target_wrapped)))
-        wraps_used.append(int(n))
-
-        last_f_khz = float(f_khz)
-        return True
-
-    x = int(x0)
-    if not record_state(x, force_f_khz=cal.f_min_khz):
-        raise RuntimeError("Failed to initialize the first state at f_min.")
-
-    period_data: int | None = None
-    phi0 = phi_measured[0]
-
-    for _ in range(1, max_steps):
-        x = (a * x) % N
-        if not record_state(x):
-            break
-
-        return_dist = np.abs(wrap_pm180(np.array(phi_measured) - phi0))
-        t = len(phi_measured) - 1
-
-        if t >= max(min_period_steps, 1) and return_dist[t] <= period_delta_deg:
+        distance = abs(wrap_pm180(measured - phi_measured[0]))
+        if t >= max(min_period_steps, 1) and distance <= period_delta_deg:
             period_data = int(t)
             break
 
@@ -523,25 +436,19 @@ def smooth_rows(
     return savgol_filter(y, window_length=window, polyorder=polyorder, axis=-1)
 
 
-def print_iteration_table(sim: Simulation) -> None:
-    print("\n--- Period table ---")
-    print(
-        "Iter | x_true -> x_next | phi_target(deg) | phi_meas(deg) | "
-        "err(deg) | f(kHz) | wrap | x_hat"
-    )
-
+def format_iteration_table(sim: Simulation) -> str:
+    rows = [("Iter", "x_ideal → x_ideal,next", "Φ_ideal (deg)", "Φ_meas (deg)",
+             "e(t) (deg)", "f₁ (kHz)")]
     for t, x in enumerate(sim.x_true):
         x_next = (sim.a * int(x)) % sim.N
-
-        print(
-            f"{t:4d} | {int(x):5d} -> {x_next:5d} | "
-            f"{sim.phi_target[t]:12.3f} | "
-            f"{sim.phi_measured[t]:11.3f} | "
-            f"{sim.phase_error_deg[t]:8.3f} | "
-            f"{sim.freq_khz[t]:7.3f} | "
-            f"{int(sim.wraps_used[t]):4d} | "
-            f"{int(sim.x_hat[t]):5d}"
-        )
+        rows.append((
+            str(t), f"{x} → {x_next}", f"{sim.phi_target[t]:.3f}",
+            f"{sim.phi_measured[t]:.3f}", f"{sim.phase_error_deg[t]:.3f}",
+            f"{sim.freq_khz[t]:.3f}",
+        ))
+    widths = [max(map(len, column)) for column in zip(*rows)]
+    return "\n".join("  ".join(value.rjust(width) for value, width in zip(row, widths))
+                     for row in rows)
 
 
 def plot_result(
@@ -657,12 +564,16 @@ def main() -> None:
                 f"min_t={sim.min_period_steps})"
             )
 
-        print_iteration_table(sim)
-
         outpdf = (
             cfg.outdir
             / f"N{case.N}_a{case.a}_W{cfg.wraps_per_band}_Delta{int(case.delta_deg)}.pdf"
         )
+
+        table = format_iteration_table(sim)
+        print(table)
+        table_path = outpdf.with_suffix(".txt")
+        table_path.write_text(table + "\n", encoding="utf-8")
+        print(f"Saved: {table_path}")
 
         plot_result(
             sim,
